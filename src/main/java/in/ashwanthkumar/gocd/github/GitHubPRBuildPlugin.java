@@ -8,17 +8,18 @@ import com.thoughtworks.go.plugin.api.logging.Logger;
 import com.thoughtworks.go.plugin.api.request.GoPluginApiRequest;
 import com.thoughtworks.go.plugin.api.response.GoPluginApiResponse;
 import com.tw.go.plugin.GitHelper;
-import com.tw.go.plugin.HelperFactory;
 import com.tw.go.plugin.model.GitConfig;
 import com.tw.go.plugin.model.ModifiedFile;
 import com.tw.go.plugin.model.Revision;
 import com.tw.go.plugin.util.ListUtil;
 import com.tw.go.plugin.util.StringUtil;
 import in.ashwanthkumar.gocd.github.provider.Provider;
+import in.ashwanthkumar.gocd.github.util.BranchFilter;
+import in.ashwanthkumar.gocd.github.util.GitFactory;
+import in.ashwanthkumar.gocd.github.util.GitFolderFactory;
 import in.ashwanthkumar.gocd.github.util.JSONUtils;
 import org.apache.commons.io.IOUtils;
 
-import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.text.SimpleDateFormat;
@@ -40,6 +41,8 @@ public class GitHubPRBuildPlugin implements GoPlugin {
     public static final String REQUEST_LATEST_REVISION = "latest-revision";
     public static final String REQUEST_LATEST_REVISIONS_SINCE = "latest-revisions-since";
     public static final String REQUEST_CHECKOUT = "checkout";
+    public static final String BRANCH_BLACKLIST_PROPERTY_NAME = "branchblacklist";
+    public static final String BRANCH_WHITELIST_PROPERTY_NAME = "branchwhitelist";
 
     public static final String BRANCH_TO_REVISION_MAP = "BRANCH_TO_REVISION_MAP";
     private static final String DATE_PATTERN = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
@@ -49,17 +52,31 @@ public class GitHubPRBuildPlugin implements GoPlugin {
     public static final int INTERNAL_ERROR_RESPONSE_CODE = 500;
 
     private Provider provider;
+    private GitFactory gitFactory;
+    private GitFolderFactory gitFolderFactory;
+    private boolean branchFilterEnabled;
 
     public GitHubPRBuildPlugin() {
         try {
             Properties properties = new Properties();
             properties.load(getClass().getResourceAsStream("/defaults.properties"));
+
+            branchFilterEnabled = Boolean.valueOf(properties.getProperty("branchFilterEnabled"));
             Class<?> providerClass = Class.forName(properties.getProperty("provider"));
             Constructor<?> constructor = providerClass.getConstructor();
             provider = (Provider) constructor.newInstance();
+            gitFactory = new GitFactory();
+            gitFolderFactory = new GitFolderFactory();
         } catch (Exception e) {
             throw new RuntimeException("could not create provider", e);
         }
+    }
+
+    public GitHubPRBuildPlugin(Provider provider, GitFactory gitFactory, GitFolderFactory gitFolderFactory, boolean branchFilterEnabled) {
+        this.provider = provider;
+        this.gitFactory = gitFactory;
+        this.gitFolderFactory = gitFolderFactory;
+        this.branchFilterEnabled = branchFilterEnabled;
     }
 
     @Override
@@ -106,13 +123,21 @@ public class GitHubPRBuildPlugin implements GoPlugin {
         response.put("url", createField("URL", null, true, true, false, "0"));
         response.put("username", createField("Username", null, false, false, false, "1"));
         response.put("password", createField("Password", null, false, false, true, "2"));
+        if (branchFilterEnabled) {
+            response.put(BRANCH_WHITELIST_PROPERTY_NAME, createField("Whitelisted branches", "", false, false, false, "3"));
+            response.put(BRANCH_BLACKLIST_PROPERTY_NAME, createField("Blacklisted branches", "", false, false, false, "4"));
+        }
         return renderJSON(SUCCESS_RESPONSE_CODE, response);
     }
 
     private GoPluginApiResponse handleSCMView() throws IOException {
         Map<String, Object> response = new HashMap<String, Object>();
         response.put("displayValue", provider.getName());
-        response.put("template", getFileContents("/scm.template.html"));
+        if (branchFilterEnabled) {
+            response.put("template", getFileContents("/scm.template.branch.filter.html"));
+        } else {
+            response.put("template", getFileContents("/scm.template.html"));
+        }
         return renderJSON(SUCCESS_RESPONSE_CODE, response);
     }
 
@@ -157,7 +182,7 @@ public class GitHubPRBuildPlugin implements GoPlugin {
         LOGGER.info(String.format("Flyweight: %s", flyweightFolder));
 
         try {
-            GitHelper git = HelperFactory.gitCmd(gitConfig, new File(flyweightFolder));
+            GitHelper git = gitFactory.create(gitConfig, gitFolderFactory.create(flyweightFolder));
             git.cloneOrFetch(provider.getRefSpec());
             Map<String, String> branchToRevisionMap = git.getBranchToRevisionMap(provider.getRefPattern());
             Revision revision = git.getLatestRevision();
@@ -186,7 +211,7 @@ public class GitHubPRBuildPlugin implements GoPlugin {
         LOGGER.debug(String.format("Fetching latest for: %s", gitConfig.getUrl()));
 
         try {
-            GitHelper git = HelperFactory.gitCmd(gitConfig, new File(flyweightFolder));
+            GitHelper git = gitFactory.create(gitConfig, gitFolderFactory.create(flyweightFolder));
             git.cloneOrFetch(provider.getRefSpec());
             Map<String, String> newBranchToRevisionMap = git.getBranchToRevisionMap(provider.getRefPattern());
 
@@ -200,16 +225,23 @@ public class GitHubPRBuildPlugin implements GoPlugin {
             }
 
             Map<String, String> newerRevisions = new HashMap<String, String>();
+
+            BranchFilter branchFilter = resolveBranchMatcher(configuration);
+
             for (String branch : newBranchToRevisionMap.keySet()) {
-                if (branchHasNewChange(oldBranchToRevisionMap.get(branch), newBranchToRevisionMap.get(branch))) {
-                    // If there are any changes we should return the only one of them.
-                    // Otherwise Go.CD skips other changes (revisions) in this call.
-                    // You can think about it like if we always return a minimum item
-                    // of a set with comparable items.
-                    String newValue = newBranchToRevisionMap.get(branch);
-                    newerRevisions.put(branch, newValue);
-                    oldBranchToRevisionMap.put(branch, newValue);
-                    break;
+                if (branchFilter.isBranchValid(branch)) {
+                    if (branchHasNewChange(oldBranchToRevisionMap.get(branch), newBranchToRevisionMap.get(branch))) {
+                        // If there are any changes we should return the only one of them.
+                        // Otherwise Go.CD skips other changes (revisions) in this call.
+                        // You can think about it like if we always return a minimum item
+                        // of a set with comparable items.
+                        String newValue = newBranchToRevisionMap.get(branch);
+                        newerRevisions.put(branch, newValue);
+                        oldBranchToRevisionMap.put(branch, newValue);
+                        break;
+                    }
+                } else {
+                    LOGGER.debug(String.format("Branch %s is filtered by branch matcher", branch));
                 }
             }
 
@@ -250,6 +282,17 @@ public class GitHubPRBuildPlugin implements GoPlugin {
         }
     }
 
+    private BranchFilter resolveBranchMatcher(Map<String, String> configuration) {
+        if (branchFilterEnabled) {
+            String blacklist = configuration.get(BRANCH_BLACKLIST_PROPERTY_NAME);
+            String whitelist = configuration.get(BRANCH_WHITELIST_PROPERTY_NAME);
+
+            return new BranchFilter(blacklist, whitelist);
+        } else {
+            return new BranchFilter();
+        }
+    }
+
     private boolean branchHasNewChange(String previousSHA, String latestSHA) {
         return previousSHA == null || !previousSHA.equals(latestSHA);
     }
@@ -264,7 +307,7 @@ public class GitHubPRBuildPlugin implements GoPlugin {
         LOGGER.info(String.format("destination: %s. commit: %s", destinationFolder, revision));
 
         try {
-            GitHelper git = HelperFactory.gitCmd(gitConfig, new File(destinationFolder));
+            GitHelper git = gitFactory.create(gitConfig, gitFolderFactory.create(destinationFolder));
             git.cloneOrFetch(provider.getRefSpec());
             git.resetHard(revision);
 
